@@ -80,24 +80,19 @@ func runFile(t *testing.T, server *httptest.Server, args ...string) (output.Resp
 	return resp, err
 }
 
-// fileEnvelopeData is the shape of data in the file JSON envelope.
-type fileEnvelopeData struct {
-	FolderID int64        `json:"folder_id"`
-	DryRun   bool         `json:"dry_run"`
-	Results  []fileResult `json:"results"`
-}
-
-func fileDataFrom(t *testing.T, resp output.Response) fileEnvelopeData {
+// fileResultsFrom decodes the results slice that `hey file` puts in data. The
+// payload is a slice rather than an object so --ids-only and --count work.
+func fileResultsFrom(t *testing.T, resp output.Response) []moveResult {
 	t.Helper()
 	raw, err := json.Marshal(resp.Data)
 	if err != nil {
 		t.Fatalf("marshal data: %v", err)
 	}
-	var data fileEnvelopeData
-	if err := json.Unmarshal(raw, &data); err != nil {
-		t.Fatalf("unmarshal data: %v", err)
+	var results []moveResult
+	if err := json.Unmarshal(raw, &results); err != nil {
+		t.Fatalf("data is not a []moveResult: %v (%s)", err, raw)
 	}
-	return data
+	return results
 }
 
 func TestFileSingleTopic(t *testing.T) {
@@ -129,12 +124,12 @@ func TestFileSingleTopic(t *testing.T) {
 		t.Errorf("summary = %q, want %q", resp.Summary, want)
 	}
 
-	data := fileDataFrom(t, resp)
-	if data.FolderID != 385684 {
-		t.Errorf("folder_id = %d, want %d", data.FolderID, 385684)
+	if got := resp.Meta["folder_id"]; got != float64(385684) {
+		t.Errorf("meta.folder_id = %v, want 385684", got)
 	}
-	if len(data.Results) != 1 || data.Results[0].Status != "filed" {
-		t.Errorf("results = %+v, want a single filed result", data.Results)
+	results := fileResultsFrom(t, resp)
+	if len(results) != 1 || results[0].Status != statusFiled {
+		t.Errorf("results = %+v, want a single filed result", results)
 	}
 }
 
@@ -216,16 +211,13 @@ func TestFileDryRunMakesNoRequests(t *testing.T) {
 		t.Errorf("summary = %q, want %q", resp.Summary, want)
 	}
 
-	data := fileDataFrom(t, resp)
-	if !data.DryRun {
-		t.Error("expected data.dry_run = true")
+	results := fileResultsFrom(t, resp)
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
 	}
-	if len(data.Results) != 2 {
-		t.Fatalf("expected 2 results, got %d", len(data.Results))
-	}
-	for i, r := range data.Results {
-		if r.Status != "would_file" {
-			t.Errorf("results[%d].status = %q, want %q", i, r.Status, "would_file")
+	for i, r := range results {
+		if r.Status != statusWouldFile {
+			t.Errorf("results[%d].status = %q, want %q", i, r.Status, statusWouldFile)
 		}
 	}
 }
@@ -240,7 +232,7 @@ func TestFilePartialFailureContinues(t *testing.T) {
 		t.Fatal("expected error when one topic fails")
 	}
 
-	// continue-on-error defaults true: every ID is still attempted.
+	// A failure must not stop the batch by default.
 	if n := captured.count(); n != 3 {
 		t.Fatalf("expected 3 requests despite the failure, got %d: %+v", n, captured.all())
 	}
@@ -249,8 +241,46 @@ func TestFilePartialFailureContinues(t *testing.T) {
 	if want := "2 topic(s) filed to folder 385684, 1 failed"; apiErr.Message != want {
 		t.Errorf("error = %q, want %q", apiErr.Message, want)
 	}
-	if !strings.Contains(apiErr.Hint, "2083481241 (failed:") {
+	if !strings.Contains(apiErr.Hint, "failed: 2083481241") {
 		t.Errorf("hint = %q, want it to name the failed topic", apiErr.Hint)
+	}
+}
+
+// TestFileStopOnErrorReportsUnattempted mirrors the move command: topics the
+// batch never reached must still be reported, or the caller cannot tell
+// "skipped" from "filed".
+func TestFileStopOnErrorReportsUnattempted(t *testing.T) {
+	captured := &capturedRequests{}
+	server := fileTopicServer(t, captured, map[int64]int{2083481241: 500})
+	defer server.Close()
+
+	_, err := runFile(t, server, "2081927723", "2083481241", "2085000000",
+		"--folder", "385684", "--stop-on-error")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if n := captured.count(); n != 2 {
+		t.Fatalf("expected 2 requests, got %d: %+v", n, captured.all())
+	}
+	if hint := output.AsError(err).Hint; !strings.Contains(hint, "not_attempted: 2085000000") {
+		t.Errorf("hint = %q, want the unreached topic reported", hint)
+	}
+}
+
+// TestFileIdsOnlyDoesNotMisreportSuccess guards the same data-safety bug the
+// move command had: an object payload made --ids-only fail *after* the filings
+// had already been performed.
+func TestFileIdsOnlyDoesNotMisreportSuccess(t *testing.T) {
+	captured := &capturedRequests{}
+	server := fileTopicServer(t, captured, nil)
+	defer server.Close()
+
+	out, err := runFileRaw(t, server, "--ids-only", "2081927723", "--folder", "385684")
+	if err != nil {
+		t.Fatalf("--ids-only errored after filing: %v (output %q)", err, out)
+	}
+	if !strings.Contains(out, "2081927723") {
+		t.Errorf("output = %q, want the filed topic ID", out)
 	}
 }
 

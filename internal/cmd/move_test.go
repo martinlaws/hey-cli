@@ -120,122 +120,113 @@ func runMove(t *testing.T, server *httptest.Server, args ...string) (output.Resp
 	out, err := runMoveRaw(t, server, append([]string{"--json"}, args...)...)
 	var resp output.Response
 	if out != "" {
-		_ = json.Unmarshal([]byte(out), &resp)
+		if uerr := json.Unmarshal([]byte(out), &resp); uerr != nil {
+			t.Fatalf("stdout is not a JSON envelope (%v): %s", uerr, out)
+		}
 	}
 	return resp, err
 }
 
-// moveEnvelopeData is the shape of data in the move JSON envelope.
-type moveEnvelopeData struct {
-	Destination string       `json:"destination"`
-	DryRun      bool         `json:"dry_run"`
-	Results     []moveResult `json:"results"`
-}
-
-func moveDataFrom(t *testing.T, resp output.Response) moveEnvelopeData {
+// moveResultsFrom decodes the results slice that `hey move` puts in data.
+func moveResultsFrom(t *testing.T, resp output.Response) []moveResult {
 	t.Helper()
-	raw, err := json.Marshal(resp.Data)
+	b, err := json.Marshal(resp.Data)
 	if err != nil {
-		t.Fatalf("marshal data: %v", err)
+		t.Fatalf("marshalling data: %v", err)
 	}
-	var data moveEnvelopeData
-	if err := json.Unmarshal(raw, &data); err != nil {
-		t.Fatalf("unmarshal data: %v", err)
+	var results []moveResult
+	if err := json.Unmarshal(b, &results); err != nil {
+		t.Fatalf("data is not a []moveResult: %v (%s)", err, b)
 	}
-	return data
+	return results
 }
 
-// assertMovePath accepts either the bare or the .json path variant.
-func assertMovePath(t *testing.T, got, wantBare string) {
+// statusOf indexes results by posting ID.
+func statusOf(results []moveResult) map[int64]string {
+	m := make(map[int64]string, len(results))
+	for _, r := range results {
+		m[r.ID] = r.Status
+	}
+	return m
+}
+
+func assertPaths(t *testing.T, captured *capturedRequests, want []string) {
 	t.Helper()
-	if got != wantBare && got != wantBare+".json" {
-		t.Errorf("path = %q, want %q or %q", got, wantBare, wantBare+".json")
+	got := captured.all()
+	if len(got) != len(want) {
+		t.Fatalf("expected %d requests, got %d: %+v", len(want), len(got), got)
+	}
+	for i, w := range want {
+		if !strings.HasPrefix(got[i].path, w) {
+			t.Errorf("request %d: path = %q, want prefix %q", i, got[i].path, w)
+		}
 	}
 }
+
+// --- destination routing ---
 
 func TestMoveRoutesByDestination(t *testing.T) {
-	tests := []struct {
-		dest      string
-		wantPath  string
-		canonical string
-		display   string
+	cases := []struct {
+		box     string
+		path    string
+		display string
 	}{
-		{"feedbox", "/postings/12345/move/feedbox", "feedbox", "The Feed"},
-		{"trailbox", "/postings/12345/move/trailbox", "trailbox", "Paper Trail"},
-		{"asidebox", "/postings/12345/move/asidebox", "asidebox", "Set Aside"},
-		{"laterbox", "/postings/12345/move/laterbox", "laterbox", "Reply Later"},
-		{"trash", "/postings/12345/trash", "trash", "Trash"},
+		{"feedbox", "/postings/12345/move/feedbox", "The Feed"},
+		{"trailbox", "/postings/12345/move/trailbox", "Paper Trail"},
+		{"asidebox", "/postings/12345/move/asidebox", "Set Aside"},
+		{"laterbox", "/postings/12345/move/laterbox", "Reply Later"},
+		{"trash", "/postings/12345/trash", "Trash"},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.dest, func(t *testing.T) {
+	for _, tc := range cases {
+		t.Run(tc.box, func(t *testing.T) {
 			captured := &capturedRequests{}
 			server := moveServer(t, captured, nil)
 			defer server.Close()
 
-			resp, err := runMove(t, server, tt.dest, "12345")
+			resp, err := runMove(t, server, tc.box, "12345")
 			if err != nil {
-				t.Fatalf("execute: %v", err)
+				t.Fatalf("move to %s: %v", tc.box, err)
 			}
-
-			reqs := captured.all()
-			if len(reqs) != 1 {
-				t.Fatalf("expected 1 request, got %d: %+v", len(reqs), reqs)
+			assertPaths(t, captured, []string{tc.path})
+			if !strings.Contains(resp.Summary, tc.display) {
+				t.Errorf("summary = %q, want it to name %q", resp.Summary, tc.display)
 			}
-			if reqs[0].method != "POST" {
-				t.Errorf("method = %q, want POST", reqs[0].method)
-			}
-			assertMovePath(t, reqs[0].path, tt.wantPath)
-
-			want := "1 posting(s) moved to " + tt.display
-			if resp.Summary != want {
-				t.Errorf("summary = %q, want %q", resp.Summary, want)
-			}
-			if got := moveDataFrom(t, resp).Destination; got != tt.canonical {
-				t.Errorf("destination = %q, want %q", got, tt.canonical)
+			if got := resp.Meta["destination"]; got != tc.box {
+				t.Errorf("meta.destination = %v, want %q", got, tc.box)
 			}
 		})
 	}
 }
 
 func TestMoveResolvesDestinationAliases(t *testing.T) {
-	tests := []struct {
-		alias    string
-		wantPath string
-		display  string
-	}{
-		{"feed", "/postings/12345/move/feedbox", "The Feed"},
-		{"the feed", "/postings/12345/move/feedbox", "The Feed"},
-		{"The Feed", "/postings/12345/move/feedbox", "The Feed"},
-		{"trail", "/postings/12345/move/trailbox", "Paper Trail"},
-		{"paper trail", "/postings/12345/move/trailbox", "Paper Trail"},
-		{"aside", "/postings/12345/move/asidebox", "Set Aside"},
-		{"set aside", "/postings/12345/move/asidebox", "Set Aside"},
-		{"later", "/postings/12345/move/laterbox", "Reply Later"},
-		{"reply later", "/postings/12345/move/laterbox", "Reply Later"},
+	cases := []struct{ alias, path string }{
+		{"feed", "/postings/1/move/feedbox"},
+		{"the feed", "/postings/1/move/feedbox"},
+		{"The Feed", "/postings/1/move/feedbox"},
+		{"  feedbox  ", "/postings/1/move/feedbox"},
+		{"trail", "/postings/1/move/trailbox"},
+		{"paper trail", "/postings/1/move/trailbox"},
+		{"papertrail", "/postings/1/move/trailbox"},
+		{"aside", "/postings/1/move/asidebox"},
+		{"set aside", "/postings/1/move/asidebox"},
+		{"setaside", "/postings/1/move/asidebox"},
+		{"later", "/postings/1/move/laterbox"},
+		{"reply later", "/postings/1/move/laterbox"},
+		{"replylater", "/postings/1/move/laterbox"},
+		{"TRASH", "/postings/1/trash"},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.alias, func(t *testing.T) {
+	for _, tc := range cases {
+		t.Run(tc.alias, func(t *testing.T) {
 			captured := &capturedRequests{}
 			server := moveServer(t, captured, nil)
 			defer server.Close()
 
-			resp, err := runMove(t, server, tt.alias, "12345")
-			if err != nil {
-				t.Fatalf("execute: %v", err)
+			if _, err := runMove(t, server, tc.alias, "1"); err != nil {
+				t.Fatalf("alias %q: %v", tc.alias, err)
 			}
-
-			reqs := captured.all()
-			if len(reqs) != 1 {
-				t.Fatalf("expected 1 request, got %d: %+v", len(reqs), reqs)
-			}
-			assertMovePath(t, reqs[0].path, tt.wantPath)
-
-			want := "1 posting(s) moved to " + tt.display
-			if resp.Summary != want {
-				t.Errorf("summary = %q, want %q", resp.Summary, want)
-			}
+			assertPaths(t, captured, []string{tc.path})
 		})
 	}
 }
@@ -247,17 +238,13 @@ func TestMoveToImboxIsRejected(t *testing.T) {
 
 	_, err := runMove(t, server, "imbox", "12345")
 	if err == nil {
-		t.Fatal("expected error for imbox destination")
+		t.Fatal("expected imbox to be rejected")
 	}
 	if code := output.AsError(err).Code; code != "usage" {
-		t.Errorf("code = %q, want %q", code, "usage")
+		t.Errorf("code = %q, want usage", code)
 	}
-	msg := err.Error()
-	if !strings.Contains(msg, "imbox") {
-		t.Errorf("error = %q, want it to mention imbox", msg)
-	}
-	if !strings.Contains(msg, "one-way") {
-		t.Errorf("error = %q, want it to say moves are one-way", msg)
+	if msg := err.Error(); !strings.Contains(msg, "one-way") {
+		t.Errorf("error = %q, want it to explain moves are one-way", msg)
 	}
 	captured.assertNoRequests(t)
 }
@@ -267,161 +254,305 @@ func TestMoveUnknownDestination(t *testing.T) {
 	server := moveServer(t, captured, nil)
 	defer server.Close()
 
-	_, err := runMove(t, server, "nonsense", "12345")
+	_, err := runMove(t, server, "nowhere", "12345")
 	if err == nil {
-		t.Fatal("expected error for unknown destination")
+		t.Fatal("expected unknown destination to be rejected")
 	}
-	if code := output.AsError(err).Code; code != "usage" {
-		t.Errorf("code = %q, want %q", code, "usage")
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "unknown destination: nonsense") {
-		t.Errorf("error = %q, want it to name the bad destination", msg)
+	e := output.AsError(err)
+	if e.Code != "usage" {
+		t.Errorf("code = %q, want usage", e.Code)
 	}
 	for _, want := range []string{"feedbox", "trailbox", "asidebox", "laterbox", "trash"} {
-		if !strings.Contains(msg, want) {
-			t.Errorf("error = %q, want it to list valid destination %q", msg, want)
+		if !strings.Contains(e.Hint, want) {
+			t.Errorf("hint = %q, want it to list %q", e.Hint, want)
 		}
 	}
 	captured.assertNoRequests(t)
 }
+
+// --- argument validation ---
+
+func TestMoveArity(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"no_args", nil},
+		{"box_only", []string{"feedbox"}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			captured := &capturedRequests{}
+			server := moveServer(t, captured, nil)
+			defer server.Close()
+
+			_, err := runMove(t, server, tc.args...)
+			if err == nil {
+				t.Fatalf("expected a usage error for args %v", tc.args)
+			}
+			if !strings.HasPrefix(err.Error(), "Usage:") {
+				t.Errorf("error = %q, want a Usage: line", err.Error())
+			}
+			captured.assertNoRequests(t)
+		})
+	}
+}
+
+func TestMoveRejectsInvalidPostingIDs(t *testing.T) {
+	cases := []struct{ name, id string }{
+		{"non_numeric", "abc"},
+		{"zero", "0"},
+		{"negative", "-5"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			captured := &capturedRequests{}
+			server := moveServer(t, captured, nil)
+			defer server.Close()
+
+			args := []string{"feedbox", tc.id}
+			if strings.HasPrefix(tc.id, "-") {
+				args = []string{"feedbox", "--", tc.id}
+			}
+			_, err := runMove(t, server, args...)
+			if err == nil {
+				t.Fatalf("expected posting ID %q to be rejected", tc.id)
+			}
+			if code := output.AsError(err).Code; code != "usage" {
+				t.Errorf("code = %q, want usage", code)
+			}
+			// The point of validating here rather than letting the API decide:
+			// a move is a mutation, so a nonsense ID must not reach the server.
+			captured.assertNoRequests(t)
+		})
+	}
+}
+
+func TestMoveDeduplicatesPostingIDs(t *testing.T) {
+	captured := &capturedRequests{}
+	server := moveServer(t, captured, nil)
+	defer server.Close()
+
+	resp, err := runMove(t, server, "feedbox", "111", "222", "111")
+	if err != nil {
+		t.Fatalf("move: %v", err)
+	}
+	// Moving the same posting twice 404s on the second, which would fail a
+	// batch the caller got right.
+	assertPaths(t, captured, []string{"/postings/111/move/feedbox", "/postings/222/move/feedbox"})
+	if got := len(moveResultsFrom(t, resp)); got != 2 {
+		t.Errorf("results = %d, want 2", got)
+	}
+}
+
+// --- batching ---
 
 func TestMoveMultiplePostings(t *testing.T) {
 	captured := &capturedRequests{}
 	server := moveServer(t, captured, nil)
 	defer server.Close()
 
-	resp, err := runMove(t, server, "trailbox", "12345", "67890", "11111")
+	resp, err := runMove(t, server, "trailbox", "111", "222", "333")
 	if err != nil {
-		t.Fatalf("execute: %v", err)
+		t.Fatalf("move: %v", err)
 	}
-
-	reqs := captured.all()
-	if len(reqs) != 3 {
-		t.Fatalf("expected 3 requests, got %d: %+v", len(reqs), reqs)
-	}
-	wantPaths := []string{
-		"/postings/12345/move/trailbox",
-		"/postings/67890/move/trailbox",
-		"/postings/11111/move/trailbox",
-	}
-	for i, want := range wantPaths {
-		assertMovePath(t, reqs[i].path, want)
-	}
-
-	if resp.Summary != "3 posting(s) moved to Paper Trail" {
-		t.Errorf("summary = %q, want %q", resp.Summary, "3 posting(s) moved to Paper Trail")
-	}
-
-	results := moveDataFrom(t, resp).Results
-	if len(results) != 3 {
-		t.Fatalf("expected 3 results, got %d", len(results))
-	}
-	for i, id := range []int64{12345, 67890, 11111} {
-		if results[i].PostingID != id {
-			t.Errorf("results[%d].posting_id = %d, want %d", i, results[i].PostingID, id)
-		}
-		if results[i].Status != "moved" {
-			t.Errorf("results[%d].status = %q, want %q", i, results[i].Status, "moved")
+	assertPaths(t, captured, []string{
+		"/postings/111/move/trailbox",
+		"/postings/222/move/trailbox",
+		"/postings/333/move/trailbox",
+	})
+	for id, status := range statusOf(moveResultsFrom(t, resp)) {
+		if status != statusMoved {
+			t.Errorf("posting %d: status = %q, want moved", id, status)
 		}
 	}
 }
 
-func TestMovePartialFailureContinues(t *testing.T) {
+func TestMovePartialFailureAttemptsEveryPosting(t *testing.T) {
 	captured := &capturedRequests{}
-	server := moveServer(t, captured, map[int64]int{67890: 500})
+	server := moveServer(t, captured, map[int64]int{222: 500})
 	defer server.Close()
 
-	_, err := runMove(t, server, "feedbox", "12345", "67890", "11111")
+	_, err := runMove(t, server, "feedbox", "111", "222", "333")
 	if err == nil {
-		t.Fatal("expected error when one posting fails")
+		t.Fatal("expected an error when one posting fails")
 	}
-
-	// continue-on-error defaults true: every ID is still attempted.
-	reqs := captured.all()
-	if len(reqs) != 3 {
-		t.Fatalf("expected 3 requests despite the failure, got %d: %+v", len(reqs), reqs)
-	}
-	for i, want := range []string{
-		"/postings/12345/move/feedbox",
-		"/postings/67890/move/feedbox",
-		"/postings/11111/move/feedbox",
-	} {
-		assertMovePath(t, reqs[i].path, want)
-	}
-
-	apiErr := output.AsError(err)
-	if want := "2 posting(s) moved to The Feed, 1 failed"; apiErr.Message != want {
-		t.Errorf("error = %q, want %q", apiErr.Message, want)
-	}
-	if !strings.Contains(apiErr.Hint, "67890 (failed:") {
-		t.Errorf("hint = %q, want it to name the failed posting", apiErr.Hint)
+	// The failure must not stop the batch by default.
+	assertPaths(t, captured, []string{
+		"/postings/111/move/feedbox",
+		"/postings/222/move/feedbox",
+		"/postings/333/move/feedbox",
+	})
+	if hint := output.AsError(err).Hint; !strings.Contains(hint, "failed: 222") {
+		t.Errorf("hint = %q, want it to name 222 as failed", hint)
 	}
 }
 
 func TestMoveNotFoundIsDistinctFromFailed(t *testing.T) {
 	captured := &capturedRequests{}
-	server := moveServer(t, captured, map[int64]int{67890: 404})
+	server := moveServer(t, captured, map[int64]int{222: 404, 333: 500})
 	defer server.Close()
 
-	_, err := runMove(t, server, "feedbox", "12345", "67890")
+	_, err := runMove(t, server, "feedbox", "111", "222", "333")
 	if err == nil {
-		t.Fatal("expected error when one posting 404s")
+		t.Fatal("expected an error")
 	}
-	if captured.count() != 2 {
-		t.Errorf("expected 2 requests, got %d", captured.count())
+	hint := output.AsError(err).Hint
+	if !strings.Contains(hint, "not_found: 222") {
+		t.Errorf("hint = %q, want 222 classified not_found", hint)
 	}
-	if hint := output.AsError(err).Hint; !strings.Contains(hint, "67890 (not_found:") {
-		t.Errorf("hint = %q, want a not_found status for 67890", hint)
+	if !strings.Contains(hint, "failed: 333") {
+		t.Errorf("hint = %q, want 333 classified failed", hint)
 	}
 }
 
-func TestMoveDryRunMakesNoRequests(t *testing.T) {
+// TestMoveAllNotFoundExitsTwo guards the command's most specific promise: exit
+// 2 means every ID was not_found, so a caller can tell stale IDs from a broken
+// server.
+func TestMoveAllNotFoundExitsTwo(t *testing.T) {
 	captured := &capturedRequests{}
-	server := moveServer(t, captured, nil)
+	server := moveServer(t, captured, map[int64]int{111: 404, 222: 404})
 	defer server.Close()
 
-	resp, err := runMove(t, server, "--dry-run", "laterbox", "12345", "67890")
-	if err != nil {
-		t.Fatalf("execute: %v", err)
+	_, err := runMove(t, server, "feedbox", "111", "222")
+	if err == nil {
+		t.Fatal("expected an error when every posting 404s")
 	}
-	captured.assertNoRequests(t)
+	if code := output.ExitCodeFor(err); code != output.ExitNotFound {
+		t.Errorf("exit code = %d, want %d (not_found)", code, output.ExitNotFound)
+	}
+	if c := output.AsError(err).Code; c != "not_found" {
+		t.Errorf("code = %q, want not_found", c)
+	}
+}
 
-	want := "dry run: 2 posting(s) would move to Reply Later"
-	if resp.Summary != want {
-		t.Errorf("summary = %q, want %q", resp.Summary, want)
-	}
+// TestMoveMixedFailureIsNotNotFound is the other half: a 404 alongside a real
+// failure must not claim every ID was stale.
+func TestMoveMixedFailureIsNotNotFound(t *testing.T) {
+	captured := &capturedRequests{}
+	server := moveServer(t, captured, map[int64]int{111: 404, 222: 500})
+	defer server.Close()
 
-	data := moveDataFrom(t, resp)
-	if !data.DryRun {
-		t.Error("expected data.dry_run = true")
+	_, err := runMove(t, server, "feedbox", "111", "222")
+	if err == nil {
+		t.Fatal("expected an error")
 	}
-	if len(data.Results) != 2 {
-		t.Fatalf("expected 2 results, got %d", len(data.Results))
+	if code := output.ExitCodeFor(err); code == output.ExitNotFound {
+		t.Error("exit code is not_found, but one posting failed for another reason")
 	}
-	for i, r := range data.Results {
-		if r.Status != "would_move" {
-			t.Errorf("results[%d].status = %q, want %q", i, r.Status, "would_move")
+}
+
+// TestMoveStopOnErrorReportsUnattempted covers the flag and the reporting bug
+// it used to have: IDs the batch never reached must still appear, or the caller
+// cannot tell "skipped" from "moved".
+func TestMoveStopOnErrorReportsUnattempted(t *testing.T) {
+	captured := &capturedRequests{}
+	server := moveServer(t, captured, map[int64]int{222: 500})
+	defer server.Close()
+
+	_, err := runMove(t, server, "feedbox", "111", "222", "333", "444", "--stop-on-error")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	assertPaths(t, captured, []string{
+		"/postings/111/move/feedbox",
+		"/postings/222/move/feedbox",
+	})
+	hint := output.AsError(err).Hint
+	for _, want := range []string{"not_attempted: 333,444", "moved: 111", "failed: 222"} {
+		if !strings.Contains(hint, want) {
+			t.Errorf("hint = %q, want it to contain %q", hint, want)
 		}
 	}
 }
 
-func TestMoveInvalidPostingID(t *testing.T) {
+// TestMoveStopOnErrorDefaultsOff guards the default: without the flag a failure
+// must not stop the batch.
+func TestMoveStopOnErrorDefaultsOff(t *testing.T) {
+	captured := &capturedRequests{}
+	server := moveServer(t, captured, map[int64]int{111: 500})
+	defer server.Close()
+
+	if _, err := runMove(t, server, "feedbox", "111", "222"); err == nil {
+		t.Fatal("expected an error")
+	}
+	if n := captured.count(); n != 2 {
+		t.Errorf("requests = %d, want 2 — the batch should continue past a failure", n)
+	}
+}
+
+// TestMoveStopsBatchOnFatalError: auth, permission and rate-limit failures hit
+// every remaining posting the same way, so the batch must abort rather than
+// hammer the server, and must keep the upstream exit code.
+func TestMoveStopsBatchOnFatalError(t *testing.T) {
+	cases := []struct {
+		name     string
+		status   int
+		wantExit int
+	}{
+		{"unauthorized", 401, output.ExitAuth},
+		{"forbidden", 403, output.ExitForbidden},
+		{"rate_limited", 429, output.ExitRateLimit},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			captured := &capturedRequests{}
+			server := moveServer(t, captured, map[int64]int{111: tc.status})
+			defer server.Close()
+
+			_, err := runMove(t, server, "feedbox", "111", "222", "333")
+			if err == nil {
+				t.Fatalf("expected an error on %d", tc.status)
+			}
+			if got := output.ExitCodeFor(err); got != tc.wantExit {
+				t.Errorf("exit code = %d, want %d", got, tc.wantExit)
+			}
+			if hint := output.AsError(err).Hint; !strings.Contains(hint, "not_attempted: 222,333") {
+				t.Errorf("hint = %q, want 222 and 333 reported not_attempted", hint)
+			}
+		})
+	}
+}
+
+// --- output formats ---
+
+// TestMoveIdsOnlyDoesNotMisreportSuccess is the regression guard for the worst
+// bug this command had: the payload was an object, --ids-only rejected it, and
+// the caller saw a usage error and exit 1 *after* the postings had moved.
+func TestMoveIdsOnlyDoesNotMisreportSuccess(t *testing.T) {
 	captured := &capturedRequests{}
 	server := moveServer(t, captured, nil)
 	defer server.Close()
 
-	_, err := runMove(t, server, "feedbox", "abc")
-	if err == nil {
-		t.Fatal("expected error for non-numeric posting ID")
+	out, err := runMoveRaw(t, server, "--ids-only", "trash", "111", "222")
+	if err != nil {
+		t.Fatalf("--ids-only returned an error after moving postings: %v (output %q)", err, out)
 	}
-	if code := output.AsError(err).Code; code != "usage" {
-		t.Errorf("code = %q, want %q", code, "usage")
+	if n := captured.count(); n != 2 {
+		t.Fatalf("requests = %d, want 2", n)
 	}
-	if msg := err.Error(); !strings.Contains(msg, "invalid posting ID: abc") {
-		t.Errorf("error = %q, want it to name the bad ID", msg)
+	for _, want := range []string{"111", "222"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output = %q, want it to list %q", out, want)
+		}
 	}
-	captured.assertNoRequests(t)
+}
+
+func TestMoveCountDoesNotMisreportSuccess(t *testing.T) {
+	captured := &capturedRequests{}
+	server := moveServer(t, captured, nil)
+	defer server.Close()
+
+	out, err := runMoveRaw(t, server, "--count", "feedbox", "111", "222", "333")
+	if err != nil {
+		t.Fatalf("--count returned an error after moving postings: %v (output %q)", err, out)
+	}
+	if strings.TrimSpace(out) != "3" {
+		t.Errorf("output = %q, want \"3\"", strings.TrimSpace(out))
+	}
 }
 
 func TestMoveStyledOutput(t *testing.T) {
@@ -429,14 +560,49 @@ func TestMoveStyledOutput(t *testing.T) {
 	server := moveServer(t, captured, nil)
 	defer server.Close()
 
-	out, err := runMoveRaw(t, server, "--styled", "asidebox", "12345")
+	out, err := runMoveRaw(t, server, "--styled", "feedbox", "111")
 	if err != nil {
-		t.Fatalf("execute: %v", err)
+		t.Fatalf("move: %v", err)
 	}
-	if want := "1 posting(s) moved to Set Aside."; !strings.Contains(out, want) {
-		t.Errorf("styled output = %q, want it to contain %q", out, want)
+	if !strings.Contains(out, "1 posting(s) moved to The Feed") {
+		t.Errorf("styled output = %q, want the summary line", out)
 	}
-	if captured.count() != 1 {
-		t.Errorf("expected 1 request, got %d", captured.count())
+}
+
+// --- dry run ---
+
+func TestMoveDryRunMakesNoRequests(t *testing.T) {
+	captured := &capturedRequests{}
+	server := moveServer(t, captured, nil)
+	defer server.Close()
+
+	resp, err := runMove(t, server, "feedbox", "--dry-run", "111", "222")
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
 	}
+	captured.assertNoRequests(t)
+
+	results := moveResultsFrom(t, resp)
+	if len(results) != 2 {
+		t.Fatalf("results = %d, want 2", len(results))
+	}
+	for _, r := range results {
+		if r.Status != statusWouldMove {
+			t.Errorf("posting %d: status = %q, want %q", r.ID, r.Status, statusWouldMove)
+		}
+	}
+}
+
+func TestMoveDryRunStillValidates(t *testing.T) {
+	captured := &capturedRequests{}
+	server := moveServer(t, captured, nil)
+	defer server.Close()
+
+	if _, err := runMove(t, server, "imbox", "--dry-run", "111"); err == nil {
+		t.Error("expected --dry-run to still reject imbox")
+	}
+	if _, err := runMove(t, server, "feedbox", "--dry-run", "0"); err == nil {
+		t.Error("expected --dry-run to still reject a zero posting ID")
+	}
+	captured.assertNoRequests(t)
 }

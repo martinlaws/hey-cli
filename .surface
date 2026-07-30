@@ -67,9 +67,9 @@ hey event list --all
 hey event list --calendar
 hey event list --limit
 hey file
-hey file --continue-on-error
 hey file --dry-run
 hey file --folder
+hey file --stop-on-error
 hey habit
 hey habit complete
 hey habit complete --date
@@ -83,8 +83,8 @@ hey journal read
 hey journal write
 hey journal write --content
 hey move
-hey move --continue-on-error
 hey move --dry-run
+hey move --stop-on-error
 hey recordings
 hey recordings --all
 hey recordings --ends-on
