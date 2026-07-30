@@ -20,6 +20,12 @@ triggers:
   - hey recordings
   # Todos
   - hey todo
+  # Moving postings
+  - hey move
+  - move to feed
+  - move to paper trail
+  - set aside
+  - reply later
   # Seen/unseen
   - hey seen
   - hey unseen
@@ -98,6 +104,7 @@ CLI for HEY email: mailboxes, email threads, replies, compose, calendars, todos,
 | Delete todo | `hey todo delete 123` |
 | Mark as seen | `hey seen 12345` |
 | Mark as unseen | `hey unseen 12345` |
+| Move to a box | `hey move trailbox 12345` |
 | Complete habit | `hey habit complete 123` |
 | Uncomplete habit | `hey habit uncomplete 123` |
 | Start time tracking | `hey timetrack start` |
@@ -122,6 +129,7 @@ Want to read email?
 ├── Read full thread? → hey threads <topic_id> --json
 ├── Mark as seen? → hey seen <posting-id>
 ├── Mark as unseen? → hey unseen <posting-id>
+├── File it away? → hey move <box> <posting-id>...
 └── Launch interactive UI? → hey (no args, launches TUI)
 ```
 
@@ -190,6 +198,11 @@ hey seen 12345                                # Mark posting as seen
 hey seen 12345 67890                          # Mark multiple postings as seen
 hey unseen 12345                              # Mark posting as unseen
 hey unseen 12345 67890                        # Mark multiple postings as unseen
+
+hey move feedbox 12345                        # Move a posting to The Feed
+hey move trailbox 12345 67890                 # Move several to Paper Trail
+hey move "reply later" 12345                  # Aliases work: feed, trail, aside, later
+hey move trailbox --dry-run 12345             # Preview without calling the API
 ```
 
 Takes posting IDs (the `id` field from `hey box` output).
