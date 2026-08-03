@@ -57,6 +57,7 @@ hey journal write
 hey journal write --content
 hey move
 hey move --dry-run
+hey move --stop-on-error
 hey recordings
 hey recordings --all
 hey recordings --ends-on

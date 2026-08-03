@@ -396,6 +396,79 @@ func TestMoveMixedFailureIsNotNotFound(t *testing.T) {
 	}
 }
 
+// TestMoveStopOnErrorReportsUnattempted covers the flag and the reporting bug
+// it used to have: IDs the batch never reached must still appear, or the caller
+// cannot tell "skipped" from "moved".
+func TestMoveStopOnErrorReportsUnattempted(t *testing.T) {
+	captured := &capturedRequests{}
+	server := moveServer(t, captured, map[int64]int{222: 500})
+	defer server.Close()
+
+	_, err := runMove(t, server, "feedbox", "111", "222", "333", "444", "--stop-on-error")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	assertPaths(t, captured, []string{
+		"/postings/111/move/feedbox",
+		"/postings/222/move/feedbox",
+	})
+	hint := output.AsError(err).Hint
+	for _, want := range []string{"not_attempted: 333,444", "moved: 111", "failed: 222"} {
+		if !strings.Contains(hint, want) {
+			t.Errorf("hint = %q, want it to contain %q", hint, want)
+		}
+	}
+}
+
+// TestMoveStopOnErrorDefaultsOff guards the default: without the flag a failure
+// must not stop the batch.
+func TestMoveStopOnErrorDefaultsOff(t *testing.T) {
+	captured := &capturedRequests{}
+	server := moveServer(t, captured, map[int64]int{111: 500})
+	defer server.Close()
+
+	if _, err := runMove(t, server, "feedbox", "111", "222"); err == nil {
+		t.Fatal("expected an error")
+	}
+	if n := captured.count(); n != 2 {
+		t.Errorf("requests = %d, want 2 — the batch should continue past a failure", n)
+	}
+}
+
+// TestMoveStopsBatchOnFatalError: auth, permission and rate-limit failures hit
+// every remaining posting the same way, so the batch must abort rather than
+// hammer the server, and must keep the upstream exit code.
+func TestMoveStopsBatchOnFatalError(t *testing.T) {
+	cases := []struct {
+		name     string
+		status   int
+		wantExit int
+	}{
+		{"unauthorized", 401, output.ExitAuth},
+		{"forbidden", 403, output.ExitForbidden},
+		{"rate_limited", 429, output.ExitRateLimit},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			captured := &capturedRequests{}
+			server := moveServer(t, captured, map[int64]int{111: tc.status})
+			defer server.Close()
+
+			_, err := runMove(t, server, "feedbox", "111", "222", "333")
+			if err == nil {
+				t.Fatalf("expected an error on %d", tc.status)
+			}
+			if got := output.ExitCodeFor(err); got != tc.wantExit {
+				t.Errorf("exit code = %d, want %d", got, tc.wantExit)
+			}
+			if hint := output.AsError(err).Hint; !strings.Contains(hint, "not_attempted: 222,333") {
+				t.Errorf("hint = %q, want 222 and 333 reported not_attempted", hint)
+			}
+		})
+	}
+}
+
 // --- output formats ---
 
 // TestMoveIdsOnlyDoesNotMisreportSuccess is the regression guard for the worst

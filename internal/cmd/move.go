@@ -3,9 +3,12 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/spf13/cobra"
 
@@ -61,10 +64,11 @@ func resolveMoveDestination(name string) (moveDestination, error) {
 
 // Statuses reported per posting.
 const (
-	statusMoved     = "moved"
-	statusNotFound  = "not_found"
-	statusFailed    = "failed"
-	statusWouldMove = "would_move"
+	statusMoved        = "moved"
+	statusNotFound     = "not_found"
+	statusFailed       = "failed"
+	statusNotAttempted = "not_attempted"
+	statusWouldMove    = "would_move"
 )
 
 // moveResult is one posting's outcome. The field is "id" so --ids-only can
@@ -76,8 +80,9 @@ type moveResult struct {
 }
 
 type moveCommand struct {
-	cmd    *cobra.Command
-	dryRun bool
+	cmd         *cobra.Command
+	dryRun      bool
+	stopOnError bool
 }
 
 func newMoveCommand() *moveCommand {
@@ -95,7 +100,7 @@ func newMoveCommand() *moveCommand {
 		Annotations: map[string]string{
 			"agent_notes": "First arg is the box: feedbox|trailbox|asidebox|laterbox|trash. " +
 				"The rest are posting IDs, not topic IDs. Every ID gets a status in the results: " +
-				"moved, not_found, or failed. Exits 2 when every ID was not_found. " +
+				"moved, not_found, failed, or not_attempted. Exits 2 when every ID was not_found. " +
 				"Use --dry-run to preview.",
 		},
 		RunE: moveCommand.run,
@@ -104,6 +109,8 @@ func newMoveCommand() *moveCommand {
 
 	moveCommand.cmd.Flags().BoolVar(&moveCommand.dryRun, "dry-run", false,
 		"Print what would move without calling the API")
+	moveCommand.cmd.Flags().BoolVar(&moveCommand.stopOnError, "stop-on-error", false,
+		"Stop at the first failure instead of attempting every posting")
 
 	return moveCommand
 }
@@ -130,18 +137,29 @@ func (c *moveCommand) run(cmd *cobra.Command, args []string) error {
 		}
 		return c.write(cmd, dest,
 			fmt.Sprintf("dry run: %d posting(s) would move to %s", len(ids), dest.display),
-			results)
+			results, nil)
 	}
 
-	results := c.moveAll(cmd.Context(), dest, ids)
-	return c.write(cmd, dest, summarize(results, dest.display), results)
+	// Each posting is a separate request, so an interrupt part-way through
+	// leaves real work done. Catch it here so the report still says what
+	// happened rather than exiting silently.
+	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	results, fatal := c.moveAll(ctx, dest, ids)
+	return c.write(cmd, dest, summarize(results, dest.display), results, fatal)
 }
 
-// moveAll attempts every ID and returns a result for each.
-func (c *moveCommand) moveAll(ctx context.Context, dest moveDestination, ids []int64) []moveResult {
+// moveAll returns a result for every ID, including ones it never attempted, and
+// a non-nil error when the batch was cut short.
+func (c *moveCommand) moveAll(ctx context.Context, dest moveDestination, ids []int64) ([]moveResult, error) {
 	results := make([]moveResult, 0, len(ids))
 
-	for _, id := range ids {
+	for i, id := range ids {
+		if ctx.Err() != nil {
+			return notAttempted(results, ids[i:]), output.ErrAPI(0, "interrupted")
+		}
+
 		err := dest.move(ctx, id)
 		if err == nil {
 			results = append(results, moveResult{ID: id, Status: statusMoved})
@@ -156,13 +174,40 @@ func (c *moveCommand) moveAll(ctx context.Context, dest moveDestination, ids []i
 			status = statusNotFound
 		}
 		results = append(results, moveResult{ID: id, Status: status, Error: converted.Error()})
+
+		if fatalForBatch(converted) {
+			return notAttempted(results, ids[i+1:]), converted
+		}
+		if c.stopOnError {
+			return notAttempted(results, ids[i+1:]), nil
+		}
 	}
 
+	return results, nil
+}
+
+// fatalForBatch reports whether an error will hit every remaining posting the
+// same way. Continuing past one of these just hammers the server: a 429 ten
+// postings into a batch of ninety would fire eighty more requests at a limiter
+// that has already said no.
+func fatalForBatch(err error) bool {
+	switch output.ExitCodeFor(err) {
+	case output.ExitAuth, output.ExitForbidden, output.ExitRateLimit:
+		return true
+	default:
+		return false
+	}
+}
+
+func notAttempted(results []moveResult, rest []int64) []moveResult {
+	for _, id := range rest {
+		results = append(results, moveResult{ID: id, Status: statusNotAttempted})
+	}
 	return results
 }
 
 func countByStatus(results []moveResult) map[string]int {
-	counts := make(map[string]int, 3)
+	counts := make(map[string]int, 4)
 	for _, r := range results {
 		counts[r.Status]++
 	}
@@ -174,7 +219,7 @@ func summarize(results []moveResult, display string) string {
 	summary := fmt.Sprintf("%d posting(s) moved to %s", counts[statusMoved], display)
 
 	var extra []string
-	for _, status := range []string{statusNotFound, statusFailed} {
+	for _, status := range []string{statusNotFound, statusFailed, statusNotAttempted} {
 		if n := counts[status]; n > 0 {
 			extra = append(extra, fmt.Sprintf("%d %s", n, strings.ReplaceAll(status, "_", " ")))
 		}
@@ -189,14 +234,21 @@ func summarize(results []moveResult, display string) string {
 // breakdown groups IDs by status. apierr.Error carries no arbitrary fields, so
 // on the failure path this string is the only record the caller gets — grouped
 // rather than one clause per posting, because a batch can be ninety long.
-func breakdown(results []moveResult) string {
-	byStatus := make(map[string][]string, 3)
+// Moved IDs are listed only when the batch was cut short, which is exactly when
+// the caller needs to know what already happened.
+func breakdown(results []moveResult, successStatus string) string {
+	byStatus := make(map[string][]string, 4)
 	for _, r := range results {
 		byStatus[r.Status] = append(byStatus[r.Status], strconv.FormatInt(r.ID, 10))
 	}
 
+	order := []string{statusNotFound, statusFailed, statusNotAttempted}
+	if len(byStatus[statusNotAttempted]) > 0 {
+		order = append([]string{successStatus}, order...)
+	}
+
 	var parts []string
-	for _, status := range []string{statusNotFound, statusFailed} {
+	for _, status := range order {
 		if ids := byStatus[status]; len(ids) > 0 {
 			parts = append(parts, fmt.Sprintf("%s: %s", status, strings.Join(ids, ",")))
 		}
@@ -227,15 +279,11 @@ func distinctErrors(results []moveResult) string {
 
 // write emits the results and picks the exit code. The payload is a slice so
 // --ids-only and --count work; the destination rides along as metadata.
-//
-// This matters more than it looks: with an object payload the writer rejects
-// --ids-only and --count, which would report a usage error and exit 1 *after*
-// the postings had already moved.
-func (c *moveCommand) write(cmd *cobra.Command, dest moveDestination, summary string, results []moveResult) error {
+func (c *moveCommand) write(cmd *cobra.Command, dest moveDestination, summary string, results []moveResult, fatal error) error {
 	counts := countByStatus(results)
-	unfinished := counts[statusNotFound] + counts[statusFailed]
+	unfinished := counts[statusNotFound] + counts[statusFailed] + counts[statusNotAttempted]
 
-	if unfinished == 0 {
+	if fatal == nil && unfinished == 0 {
 		if writer.IsStyled() {
 			out := cmd.OutOrStdout()
 			fmt.Fprintln(out, summary+".")
@@ -251,11 +299,28 @@ func (c *moveCommand) write(cmd *cobra.Command, dest moveDestination, summary st
 			output.WithMeta("destination", dest.canonical))
 	}
 
-	detail := breakdown(results)
+	detail := breakdown(results, statusMoved)
 
-	// Every ID 404'd: the IDs are the problem, so report not_found (exit 2)
-	// rather than a generic api error.
-	if counts[statusMoved] == 0 && counts[statusFailed] == 0 {
+	// A fatal error already carries the right code and a recovery hint
+	// ("Run: hey auth login"). Keep both — only the message gains the counts.
+	if fatal != nil {
+		e := output.AsError(fatal)
+		hint := detail
+		if e.Hint != "" {
+			hint = e.Hint + " — " + detail
+		}
+		return &output.Error{
+			Code:       e.Code,
+			Message:    fmt.Sprintf("%s — %s", summary, e.Message),
+			Hint:       hint,
+			HTTPStatus: e.HTTPStatus,
+			Retryable:  e.Retryable,
+		}
+	}
+
+	// Every ID was attempted and every one 404'd: the IDs are the problem, so
+	// report not_found (exit 2) rather than a generic api error.
+	if counts[statusMoved] == 0 && counts[statusNotAttempted] == 0 && counts[statusFailed] == 0 {
 		return &output.Error{Code: "not_found", Message: summary, Hint: detail, HTTPStatus: 404}
 	}
 
