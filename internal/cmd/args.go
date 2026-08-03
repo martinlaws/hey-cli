@@ -43,6 +43,16 @@ func usageMinOneArg() cobra.PositionalArgs {
 	}
 }
 
+func usageMinTwoArgs() cobra.PositionalArgs {
+	return func(cmd *cobra.Command, args []string) error {
+		if len(args) >= 2 {
+			return nil
+		}
+
+		return usageErrorf("%s", cleanUseLine(cmd.UseLine()))
+	}
+}
+
 func cleanUseLine(useLine string) string {
 	return strings.TrimSpace(strings.TrimSuffix(useLine, " [flags]"))
 }

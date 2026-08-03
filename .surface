@@ -55,6 +55,8 @@ hey journal list --limit
 hey journal read
 hey journal write
 hey journal write --content
+hey move
+hey move --dry-run
 hey recordings
 hey recordings --all
 hey recordings --ends-on
